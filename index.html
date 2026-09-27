@@ -37,8 +37,9 @@
       <label class="field">
         <span>Quelldaten</span>
         <select id="sourceResolution">
-          <option value="2">swissALTI³D 2 m – schneller</option>
-          <option value="0.5" selected>swissALTI³D 0,5 m – maximale Quelle</option>
+          <option value="auto" selected>Automatisch – empfohlen</option>
+          <option value="2">swissALTI³D 2 m – schnell</option>
+          <option value="0.5">swissALTI³D 0,5 m – nur für kleine, extrem feine Modelle</option>
         </select>
       </label>
 
@@ -72,7 +73,7 @@
 
       <label class="checkline">
         <input id="smoothMissing" type="checkbox" checked>
-        <span>Kleine Datenlücken automatisch schliessen</span>
+        <span>Kleine NoData-Restlücken interpolieren</span>
       </label>
 
       <div class="metrics" id="metrics">
@@ -92,7 +93,7 @@
 
       <details>
         <summary>Technische Details</summary>
-        <p>Die App fragt die STAC-API von data.geo.admin.ch ab, wählt pro 1-km-Kachel den neuesten Jahrgang und liest die GeoTIFF-Daten direkt im Browser. Die STL wird lokal erzeugt.</p>
+        <p>Die App fragt die STAC-API von data.geo.admin.ch ab. Im Automatikmodus wird die zur Mesh-Auflösung passende Quelle gewählt. Downloads werden parallel und mit Wiederholungs- sowie Jahrgangs-/Auflösungs-Fallback geladen. Eine STL wird nur erzeugt, wenn das Höhenraster vollständig ist.</p>
         <div id="debug" class="debug"></div>
       </details>
     </aside>
