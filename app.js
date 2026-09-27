@@ -85,6 +85,10 @@ function lv95FromLonLat(lon, lat) {
   return proj4('EPSG:4326', 'EPSG:2056', [lon, lat]);
 }
 
+function lonLatFromLv95(x, y) {
+  return proj4('EPSG:2056', 'EPSG:4326', [x, y]);
+}
+
 function projectedExtent(bounds) {
   const corners = [
     [bounds.getWest(), bounds.getSouth()], [bounds.getEast(), bounds.getSouth()],
@@ -147,8 +151,25 @@ function stacBbox(bounds) {
   return [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()].map(v => v.toFixed(8)).join(',');
 }
 
-async function fetchStacItems(bounds) {
-  let url = `${STAC_ITEMS}?bbox=${encodeURIComponent(stacBbox(bounds))}&limit=100`;
+// IMPORTANT: the STL grid is an axis-aligned LV95 rectangle. A Leaflet/WGS84
+// rectangle transformed to LV95 is not exactly the same area. Query STAC from
+// the actual LV95 model rectangle, otherwise narrow uncovered strips can appear
+// at the model edges. Padding is in metres and only affects catalogue discovery.
+function stacBboxForDims(d, paddingM = 100) {
+  const corners = [
+    [d.minX - paddingM, d.minY - paddingM],
+    [d.maxX + paddingM, d.minY - paddingM],
+    [d.maxX + paddingM, d.maxY + paddingM],
+    [d.minX - paddingM, d.maxY + paddingM]
+  ].map(([x, y]) => lonLatFromLv95(x, y));
+  const lons = corners.map(p => p[0]);
+  const lats = corners.map(p => p[1]);
+  return [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)]
+    .map(v => v.toFixed(8)).join(',');
+}
+
+async function fetchStacItemsForBbox(bboxString) {
+  let url = `${STAC_ITEMS}?bbox=${encodeURIComponent(bboxString)}&limit=100`;
   const all = [];
   let page = 0;
   while (url && page < MAX_STAC_PAGES) {
@@ -264,7 +285,12 @@ function outputGrid(d) {
     rows = maxN;
     cols = Math.max(2, Math.round(maxN * d.groundW / d.groundH));
   }
-  return { cols, rows, values: new Float32Array(cols * rows).fill(NaN) };
+  return {
+    cols, rows,
+    values: new Float32Array(cols * rows).fill(NaN),
+    sums: new Float64Array(cols * rows),
+    counts: new Uint16Array(cols * rows)
+  };
 }
 
 function indexRangeForTile(tileBox, d, grid) {
@@ -285,9 +311,8 @@ function indexRangeForTile(tileBox, d, grid) {
 
 async function sampleTile(url, d, grid, resolution = 2) {
   let tiff;
-  // 2 m COGs are only about 1 MB/tile. One complete request is both faster and
-  // more reliable than many HTTP range requests. 0.5 m COGs are ~26 MB/tile,
-  // so they continue to use range access.
+  // 2 m COGs are small enough to download completely. 0.5 m COGs continue
+  // to use HTTP range access so a large landscape remains practical.
   if (resolution >= 2) {
     const response = await fetchWithRetry(url, { cache: 'force-cache' });
     const buffer = await response.arrayBuffer();
@@ -308,7 +333,7 @@ async function sampleTile(url, d, grid, resolution = 2) {
 
   try {
     const image = await tiff.getImage();
-    const box = image.getBoundingBox(); // [minX,minY,maxX,maxY]
+    const box = image.getBoundingBox(); // pixel-edge bbox [minX,minY,maxX,maxY]
     const ir = indexRangeForTile(box, d, grid);
     if (!ir) return 0;
 
@@ -316,32 +341,80 @@ async function sampleTile(url, d, grid, resolution = 2) {
     const resX = (box[2] - box[0]) / imgW;
     const resY = (box[3] - box[1]) / imgH;
 
+    // Read native pixels around the required output points. Do NOT ask
+    // GeoTIFF.js to resize every tile independently: independent resize grids
+    // are the main cause of visible 1-km seams in the final terrain.
     const xMin = d.minX + ir.c0 / (grid.cols - 1) * d.groundW;
     const xMax = d.minX + ir.c1 / (grid.cols - 1) * d.groundW;
     const yMax = d.maxY - ir.r0 / (grid.rows - 1) * d.groundH;
     const yMin = d.maxY - ir.r1 / (grid.rows - 1) * d.groundH;
 
-    const wx0 = Math.max(0, Math.floor((xMin - box[0]) / resX));
-    const wx1 = Math.min(imgW, Math.ceil((xMax - box[0]) / resX) + 1);
-    const wy0 = Math.max(0, Math.floor((box[3] - yMax) / resY));
-    const wy1 = Math.min(imgH, Math.ceil((box[3] - yMin) / resY) + 1);
+    // Pixel centres are half a pixel inside the bounding box. Keep a small
+    // native-pixel halo for bilinear interpolation right across tile edges.
+    const px0f = (xMin - box[0]) / resX - 0.5;
+    const px1f = (xMax - box[0]) / resX - 0.5;
+    const py0f = (box[3] - yMax) / resY - 0.5;
+    const py1f = (box[3] - yMin) / resY - 0.5;
+    const wx0 = Math.max(0, Math.floor(Math.min(px0f, px1f)) - 2);
+    const wx1 = Math.min(imgW, Math.ceil(Math.max(px0f, px1f)) + 3);
+    const wy0 = Math.max(0, Math.floor(Math.min(py0f, py1f)) - 2);
+    const wy1 = Math.min(imgH, Math.ceil(Math.max(py0f, py1f)) + 3);
     if (wx1 <= wx0 || wy1 <= wy0) return 0;
 
-    const outW = ir.c1 - ir.c0 + 1;
-    const outH = ir.r1 - ir.r0 + 1;
     const data = await image.readRasters({
-      window: [wx0, wy0, wx1, wy1], width: outW, height: outH,
-      samples: [0], interleave: true, resampleMethod: 'bilinear'
+      window: [wx0, wy0, wx1, wy1], samples: [0], interleave: true
     });
+    const srcW = wx1 - wx0, srcH = wy1 - wy0;
     const noDataRaw = image.getGDALNoData();
     const noData = noDataRaw == null ? null : Number(noDataRaw);
+
+    const valid = (v) => Number.isFinite(v) && !(noData != null && Math.abs(v - noData) < 1e-6) && v >= -1000;
+    const at = (x, y) => {
+      x = Math.max(0, Math.min(srcW - 1, x));
+      y = Math.max(0, Math.min(srcH - 1, y));
+      return Number(data[y * srcW + x]);
+    };
+
+    const bilinearAtMap = (x, y) => {
+      // Convert the exact global LV95 coordinate to native pixel-centre space.
+      const px = (x - box[0]) / resX - 0.5 - wx0;
+      const py = (box[3] - y) / resY - 0.5 - wy0;
+      const x0 = Math.floor(px), y0 = Math.floor(py);
+      const tx = px - x0, ty = py - y0;
+      const v00 = at(x0, y0), v10 = at(x0 + 1, y0);
+      const v01 = at(x0, y0 + 1), v11 = at(x0 + 1, y0 + 1);
+      if (valid(v00) && valid(v10) && valid(v01) && valid(v11)) {
+        const a = v00 * (1 - tx) + v10 * tx;
+        const b = v01 * (1 - tx) + v11 * tx;
+        return a * (1 - ty) + b * ty;
+      }
+      // Near a NoData edge use the nearest valid native sample instead of
+      // inventing a low value that could create a trench.
+      const nearest = [v00, v10, v01, v11].filter(valid);
+      return nearest.length ? nearest.reduce((a,b) => a+b, 0) / nearest.length : NaN;
+    };
+
     let written = 0;
-    for (let rr = 0; rr < outH; rr++) {
-      for (let cc = 0; cc < outW; cc++) {
-        const v = Number(data[rr * outW + cc]);
-        if (!Number.isFinite(v) || (noData != null && Math.abs(v - noData) < 1e-6) || v < -1000) continue;
-        grid.values[(ir.r0 + rr) * grid.cols + ir.c0 + cc] = v;
-        written++;
+    for (let r = ir.r0; r <= ir.r1; r++) {
+      const y = d.maxY - r / (grid.rows - 1) * d.groundH;
+      // Tile bbox is half-open for ownership. This prevents neighbouring
+      // workers from alternately overwriting the same grid line.
+      if (y < box[1] - 1e-6 || y > box[3] + 1e-6) continue;
+      for (let c = ir.c0; c <= ir.c1; c++) {
+        const x = d.minX + c / (grid.cols - 1) * d.groundW;
+        if (x < box[0] - 1e-6 || x > box[2] + 1e-6) continue;
+        const v = bilinearAtMap(x, y);
+        if (!valid(v)) continue;
+        const gi = r * grid.cols + c;
+        // Average samples where adjacent 1-km tiles meet. At a tile boundary
+        // each raster can only interpolate from its own interior pixel centres;
+        // averaging both sides reconstructs the boundary value and removes the
+        // characteristic horizontal/vertical 'weld seam' without blurring terrain.
+        const wasMissing = grid.counts[gi] === 0;
+        grid.sums[gi] += v;
+        grid.counts[gi] += 1;
+        grid.values[gi] = grid.sums[gi] / grid.counts[gi];
+        if (wasMissing) written++;
       }
     }
     return written;
@@ -417,6 +490,52 @@ function fillSmallGaps(grid, passes = 12) {
   return totalChanged;
 }
 
+// Remove only step-like artefacts exactly on the 1-km swissALTI tile grid.
+// We compare the cross-boundary jump with the local slopes on both sides and
+// distribute only the anomalous component over a few cells. Genuine terrain
+// slope is retained; this is deliberately not a global blur.
+function missingTileKeys(grid, d, neighbourRing = 1) {
+  const keys = new Set();
+  for (let r = 0; r < grid.rows; r++) {
+    for (let c = 0; c < grid.cols; c++) {
+      const i = r * grid.cols + c;
+      if (Number.isFinite(grid.values[i])) continue;
+      const x = d.minX + c / (grid.cols - 1) * d.groundW;
+      const y = d.maxY - r / (grid.rows - 1) * d.groundH;
+      const tx = Math.floor(x / 1000);
+      const ty = Math.floor(y / 1000);
+      for (let dx = -neighbourRing; dx <= neighbourRing; dx++) {
+        for (let dy = -neighbourRing; dy <= neighbourRing; dy++) {
+          keys.add(`${tx + dx}-${ty + dy}`);
+        }
+      }
+    }
+  }
+  return keys;
+}
+
+async function recoverMissingCoverage(grid, d, preferredResolution, progressBase = 82) {
+  let stats = terrainStats(grid);
+  if (!stats.missing) return { passes: 0, recovered: 0, queried: 0 };
+  const before = stats.missing;
+  let queried = 0;
+
+  // A larger catalogue bbox guarantees that tiles intersecting the true LV95
+  // model rectangle are discoverable even close to projection/selection edges.
+  for (let pass = 1; pass <= 2 && stats.missing > 0; pass++) {
+    const needed = missingTileKeys(grid, d, 1);
+    const bbox = stacBboxForDims(d, pass === 1 ? 1600 : 2600);
+    setStatus(`Abdeckung vervollständigen · Durchgang ${pass}`, progressBase + pass * 2);
+    const items = await fetchStacItemsForBbox(bbox);
+    queried += items.length;
+    const plans = makeTilePlans(items, preferredResolution).filter(p => needed.has(p.key));
+    if (!plans.length) break;
+    await loadPlansConcurrent(plans, d, grid, () => {});
+    stats = terrainStats(grid);
+  }
+  return { passes: 2, recovered: before - stats.missing, queried };
+}
+
 function terrainStats(grid) {
   let min = Infinity, max = -Infinity, missing = 0;
   for (const v of grid.values) {
@@ -443,10 +562,12 @@ async function generateTerrain() {
     const sourceRes = sourceSetting === 'auto' ? chooseAutomaticResolution(d, grid) : Number(sourceSetting);
     const meshSpacingM = Math.max(d.groundW / Math.max(1, grid.cols - 1), d.groundH / Math.max(1, grid.rows - 1));
 
+    const catalogueBbox = stacBboxForDims(d, 100);
     debug(`STAC: ${STAC_ITEMS}`);
-    debug(`BBOX: ${stacBbox(selectedBounds)}`);
+    debug(`Karten-BBOX: ${stacBbox(selectedBounds)}`);
+    debug(`Abdeckungs-BBOX (aus tatsächlichem LV95-Modell): ${catalogueBbox}`);
     debug(`Mesh-Bodenabstand: ${meshSpacingM.toFixed(2)} m · gewählte Quelle: ${sourceRes} m${sourceSetting === 'auto' ? ' (automatisch)' : ''}`);
-    const items = await fetchStacItems(selectedBounds);
+    const items = await fetchStacItemsForBbox(catalogueBbox);
     debug(`${items.length} STAC-Items gefunden.`);
     const plans = makeTilePlans(items, sourceRes);
     debug(`${plans.length} räumliche 1-km-Kacheln geplant; Fallback-Jahrgänge und Alternativauflösung verfügbar.`);
@@ -464,17 +585,32 @@ async function generateTerrain() {
       if (loadResult.failed.length > 30) debug(`  … ${loadResult.failed.length - 30} weitere`);
     }
 
-    setStatus('Raster prüfen und Restlücken interpolieren', 82);
+    setStatus('Rasterabdeckung prüfen', 82);
+    let statsBeforeRecovery = terrainStats(grid);
+    let recovery = { passes: 0, recovered: 0, queried: 0 };
+    if (statsBeforeRecovery.missing > 0) {
+      debug(`Nach Erstladung fehlen ${statsBeforeRecovery.missing.toLocaleString('de-CH')} Punkte. Coverage-Recovery wird gestartet.`);
+      recovery = await recoverMissingCoverage(grid, d, sourceRes, 82);
+      debug(`Coverage-Recovery: ${recovery.recovered.toLocaleString('de-CH')} Punkte nachgeladen.`);
+    }
+
+    // Interpolate only genuinely isolated residual NoData cells after every
+    // possible source tile has been tried. Never use interpolation to hide a
+    // missing catalogue/download strip.
+    setStatus('Isolierte Restlücken prüfen', 87);
     let filled = 0;
-    if (els.smoothMissing.checked) filled = fillSmallGaps(grid);
+    let preFill = terrainStats(grid);
+    if (els.smoothMissing.checked && preFill.missing > 0 && preFill.missing / preFill.total < 0.001) {
+      filled = fillSmallGaps(grid, 20);
+    }
     const stats = terrainStats(grid);
     const missingPct = stats.missing / stats.total * 100;
-    debug(`Raster: ${grid.cols} × ${grid.rows}; geschrieben: ${loadResult.totalWritten}; interpoliert: ${filled}; Restlücken: ${missingPct.toFixed(4)} %`);
+    debug(`Raster: ${grid.cols} × ${grid.rows}; Erstbelegung: ${loadResult.totalWritten}; Recovery: ${recovery.recovered}; isoliert interpoliert: ${filled}; Restlücken: ${missingPct.toFixed(4)} %`);
     if (!Number.isFinite(stats.min)) throw new Error('Keine gültigen Höhenwerte geladen.');
     // Critical invariant: never export a terrain with NaN / missing elevations.
     // A failed generation is preferable to a rectangular crater in the print.
     if (stats.missing > 0) {
-      throw new Error(`Relief nicht erzeugt: ${stats.missing.toLocaleString('de-CH')} Höhenpunkte (${missingPct.toFixed(3)} %) fehlen noch. Es wird bewusst KEINE fehlerhafte STL mit Löchern erzeugt. Bitte erneut versuchen; die App nutzt automatisch Fallback-Kacheln.`);
+      throw new Error(`Relief nicht erzeugt: ${stats.missing.toLocaleString('de-CH')} Höhenpunkte (${missingPct.toFixed(3)} %) fehlen noch. Es wird bewusst KEINE fehlerhafte STL mit Löchern erzeugt. Die Abdeckung wurde bereits automatisch nachgeladen und mit Fallback-Jahrgängen/-Auflösungen geprüft. Bitte das technische Log melden; eine defekte STL wird nicht ausgegeben.`);
     }
 
     terrain = { grid, dims: d, stats };
