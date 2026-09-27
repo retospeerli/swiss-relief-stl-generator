@@ -5,6 +5,9 @@ const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
+const TILE_CONCURRENCY = 6;
+const REQUEST_RETRIES = 3;
+const RETRY_BASE_MS = 450;
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -151,8 +154,7 @@ async function fetchStacItems(bounds) {
   while (url && page < MAX_STAC_PAGES) {
     page++;
     setStatus(`STAC-Katalog abfragen · Seite ${page}`, Math.min(12, page));
-    const r = await fetch(url);
-    if (!r.ok) throw new Error(`STAC-Abfrage fehlgeschlagen: HTTP ${r.status}`);
+    const r = await fetchWithRetry(url, { cache: 'no-cache' });
     const json = await r.json();
     all.push(...(json.features || []));
     if (all.length > 12000) throw new Error('Zu viele STAC-Einträge. Bitte einen kleineren Ausschnitt wählen.');
@@ -193,16 +195,63 @@ function findGeoTiffAsset(item, resolution) {
   return assets.find(a => /\.tiff?(?:$|\?)/i.test(String(a.href || '')) && String(a.href).includes(token)) || null;
 }
 
-function chooseLatestTiles(items, resolution) {
-  const latest = new Map();
+function groupTileCandidates(items) {
+  const groups = new Map();
   for (const item of items) {
-    const asset = findGeoTiffAsset(item, resolution);
-    if (!asset) continue;
     const key = tileKey(item);
-    const prev = latest.get(key);
-    if (!prev || itemYear(item) > itemYear(prev.item)) latest.set(key, { item, asset });
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
   }
-  return [...latest.values()];
+  for (const arr of groups.values()) arr.sort((a, b) => itemYear(b) - itemYear(a));
+  return groups;
+}
+
+function makeTilePlans(items, preferredResolution) {
+  const groups = groupTileCandidates(items);
+  const fallbackResolution = preferredResolution === 0.5 ? 2 : 0.5;
+  const plans = [];
+  for (const [key, versions] of groups) {
+    const candidates = [];
+    // First try newest versions in the requested/automatic resolution.
+    for (const item of versions) {
+      const asset = findGeoTiffAsset(item, preferredResolution);
+      if (asset) candidates.push({ item, asset, resolution: preferredResolution });
+    }
+    // If that fails, prefer 2 m as a compact and very robust fallback.
+    // For a forced 2 m request we only add 0.5 m after all 2 m versions.
+    for (const item of versions) {
+      const asset = findGeoTiffAsset(item, fallbackResolution);
+      if (asset) candidates.push({ item, asset, resolution: fallbackResolution });
+    }
+    if (candidates.length) plans.push({ key, candidates });
+  }
+  return plans;
+}
+
+function chooseAutomaticResolution(d, grid) {
+  const sx = d.groundW / Math.max(1, grid.cols - 1);
+  const sy = d.groundH / Math.max(1, grid.rows - 1);
+  const meshGroundSpacing = Math.max(sx, sy);
+  // 2 m source is still comfortably finer than a mesh with >= 4 m spacing.
+  // This reduces a typical tile from ~26 MB to ~1 MB without reducing STL detail.
+  return meshGroundSpacing >= 4 ? 2 : 0.5;
+}
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+async function fetchWithRetry(url, options = {}, retries = REQUEST_RETRIES) {
+  let lastErr;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const r = await fetch(url, options);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r;
+    } catch (err) {
+      lastErr = err;
+      if (attempt + 1 < retries) await sleep(RETRY_BASE_MS * (2 ** attempt));
+    }
+  }
+  throw lastErr || new Error('Download fehlgeschlagen');
 }
 
 function outputGrid(d) {
@@ -234,49 +283,116 @@ function indexRangeForTile(tileBox, d, grid) {
   return { c0, c1, r0, r1 };
 }
 
-async function sampleTile(url, d, grid) {
-  const tiff = await GeoTIFF.fromUrl(url, { allowFullFile: true });
-  const image = await tiff.getImage();
-  const box = image.getBoundingBox(); // [minX,minY,maxX,maxY]
-  const ir = indexRangeForTile(box, d, grid);
-  if (!ir) return 0;
-
-  const imgW = image.getWidth(), imgH = image.getHeight();
-  const resX = (box[2] - box[0]) / imgW;
-  const resY = (box[3] - box[1]) / imgH;
-
-  const xMin = d.minX + ir.c0 / (grid.cols - 1) * d.groundW;
-  const xMax = d.minX + ir.c1 / (grid.cols - 1) * d.groundW;
-  const yMax = d.maxY - ir.r0 / (grid.rows - 1) * d.groundH;
-  const yMin = d.maxY - ir.r1 / (grid.rows - 1) * d.groundH;
-
-  const wx0 = Math.max(0, Math.floor((xMin - box[0]) / resX));
-  const wx1 = Math.min(imgW, Math.ceil((xMax - box[0]) / resX) + 1);
-  const wy0 = Math.max(0, Math.floor((box[3] - yMax) / resY));
-  const wy1 = Math.min(imgH, Math.ceil((box[3] - yMin) / resY) + 1);
-  if (wx1 <= wx0 || wy1 <= wy0) return 0;
-
-  const outW = ir.c1 - ir.c0 + 1;
-  const outH = ir.r1 - ir.r0 + 1;
-  const data = await image.readRasters({ window: [wx0, wy0, wx1, wy1], width: outW, height: outH, samples: [0], interleave: true, resampleMethod: 'bilinear' });
-  const noDataRaw = image.getGDALNoData();
-  const noData = noDataRaw == null ? null : Number(noDataRaw);
-  let written = 0;
-  for (let rr = 0; rr < outH; rr++) {
-    for (let cc = 0; cc < outW; cc++) {
-      const v = Number(data[rr * outW + cc]);
-      if (!Number.isFinite(v) || (noData != null && Math.abs(v - noData) < 1e-6) || v < -1000) continue;
-      grid.values[(ir.r0 + rr) * grid.cols + ir.c0 + cc] = v;
-      written++;
+async function sampleTile(url, d, grid, resolution = 2) {
+  let tiff;
+  // 2 m COGs are only about 1 MB/tile. One complete request is both faster and
+  // more reliable than many HTTP range requests. 0.5 m COGs are ~26 MB/tile,
+  // so they continue to use range access.
+  if (resolution >= 2) {
+    const response = await fetchWithRetry(url, { cache: 'force-cache' });
+    const buffer = await response.arrayBuffer();
+    tiff = await GeoTIFF.fromArrayBuffer(buffer);
+  } else {
+    let lastErr;
+    for (let attempt = 0; attempt < REQUEST_RETRIES; attempt++) {
+      try {
+        tiff = await GeoTIFF.fromUrl(url, { allowFullFile: false, cacheSize: 64 * 1024 * 1024 });
+        break;
+      } catch (err) {
+        lastErr = err;
+        if (attempt + 1 < REQUEST_RETRIES) await sleep(RETRY_BASE_MS * (2 ** attempt));
+      }
     }
+    if (!tiff) throw lastErr || new Error('GeoTIFF konnte nicht geöffnet werden');
   }
-  if (typeof tiff.close === 'function') tiff.close();
-  return written;
+
+  try {
+    const image = await tiff.getImage();
+    const box = image.getBoundingBox(); // [minX,minY,maxX,maxY]
+    const ir = indexRangeForTile(box, d, grid);
+    if (!ir) return 0;
+
+    const imgW = image.getWidth(), imgH = image.getHeight();
+    const resX = (box[2] - box[0]) / imgW;
+    const resY = (box[3] - box[1]) / imgH;
+
+    const xMin = d.minX + ir.c0 / (grid.cols - 1) * d.groundW;
+    const xMax = d.minX + ir.c1 / (grid.cols - 1) * d.groundW;
+    const yMax = d.maxY - ir.r0 / (grid.rows - 1) * d.groundH;
+    const yMin = d.maxY - ir.r1 / (grid.rows - 1) * d.groundH;
+
+    const wx0 = Math.max(0, Math.floor((xMin - box[0]) / resX));
+    const wx1 = Math.min(imgW, Math.ceil((xMax - box[0]) / resX) + 1);
+    const wy0 = Math.max(0, Math.floor((box[3] - yMax) / resY));
+    const wy1 = Math.min(imgH, Math.ceil((box[3] - yMin) / resY) + 1);
+    if (wx1 <= wx0 || wy1 <= wy0) return 0;
+
+    const outW = ir.c1 - ir.c0 + 1;
+    const outH = ir.r1 - ir.r0 + 1;
+    const data = await image.readRasters({
+      window: [wx0, wy0, wx1, wy1], width: outW, height: outH,
+      samples: [0], interleave: true, resampleMethod: 'bilinear'
+    });
+    const noDataRaw = image.getGDALNoData();
+    const noData = noDataRaw == null ? null : Number(noDataRaw);
+    let written = 0;
+    for (let rr = 0; rr < outH; rr++) {
+      for (let cc = 0; cc < outW; cc++) {
+        const v = Number(data[rr * outW + cc]);
+        if (!Number.isFinite(v) || (noData != null && Math.abs(v - noData) < 1e-6) || v < -1000) continue;
+        grid.values[(ir.r0 + rr) * grid.cols + ir.c0 + cc] = v;
+        written++;
+      }
+    }
+    return written;
+  } finally {
+    if (typeof tiff?.close === 'function') tiff.close();
+  }
 }
 
-function fillSmallGaps(grid, passes = 5) {
-  const { cols, rows, values } = grid;
-  let src = values;
+async function loadTilePlan(plan, d, grid) {
+  const errors = [];
+  for (const candidate of plan.candidates) {
+    try {
+      const written = await sampleTile(candidate.asset.href, d, grid, candidate.resolution);
+      if (written > 0) return { written, candidate, errors };
+      errors.push(`${candidate.item.id} (${candidate.resolution} m): kein Überlappungsbereich`);
+    } catch (err) {
+      errors.push(`${candidate.item.id} (${candidate.resolution} m): ${err.message}`);
+    }
+  }
+  return { written: 0, candidate: null, errors };
+}
+
+async function loadPlansConcurrent(plans, d, grid, progressCb) {
+  let next = 0, done = 0, totalWritten = 0;
+  const failed = [];
+  const fallbackUsed = [];
+
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= plans.length) return;
+      const plan = plans[i];
+      const result = await loadTilePlan(plan, d, grid);
+      totalWritten += result.written;
+      if (!result.candidate) failed.push({ plan, errors: result.errors });
+      else if (result.candidate !== plan.candidates[0]) fallbackUsed.push(result.candidate);
+      done++;
+      progressCb(done, plans.length);
+      if (done % 12 === 0) await sleep(0);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(TILE_CONCURRENCY, plans.length) }, () => worker());
+  await Promise.all(workers);
+  return { totalWritten, failed, fallbackUsed };
+}
+
+function fillSmallGaps(grid, passes = 12) {
+  const { cols, rows } = grid;
+  let src = grid.values;
+  let totalChanged = 0;
   for (let pass = 0; pass < passes; pass++) {
     let changed = 0;
     const dst = new Float32Array(src);
@@ -291,12 +407,14 @@ function fillSmallGaps(grid, passes = 5) {
         const v = src[rr * cols + cc];
         if (Number.isFinite(v)) { sum += v; n++; }
       }
-      if (n >= 3) { dst[i] = sum / n; changed++; }
+      if (n >= 4) { dst[i] = sum / n; changed++; }
     }
     src = dst;
+    totalChanged += changed;
     if (!changed) break;
   }
   grid.values = src;
+  return totalChanged;
 }
 
 function terrainStats(grid) {
@@ -320,41 +438,43 @@ async function generateTerrain() {
     const d = modelDimensions();
     if (d.groundW > 80000 || d.groundH > 80000) throw new Error('Version 1 ist auf Ausschnitte bis etwa 80 × 80 km begrenzt. Bitte ein kleineres Gebiet wählen.');
 
-    const sourceRes = Number(els.sourceResolution.value);
+    const grid = outputGrid(d);
+    const sourceSetting = els.sourceResolution.value;
+    const sourceRes = sourceSetting === 'auto' ? chooseAutomaticResolution(d, grid) : Number(sourceSetting);
+    const meshSpacingM = Math.max(d.groundW / Math.max(1, grid.cols - 1), d.groundH / Math.max(1, grid.rows - 1));
+
     debug(`STAC: ${STAC_ITEMS}`);
     debug(`BBOX: ${stacBbox(selectedBounds)}`);
+    debug(`Mesh-Bodenabstand: ${meshSpacingM.toFixed(2)} m · gewählte Quelle: ${sourceRes} m${sourceSetting === 'auto' ? ' (automatisch)' : ''}`);
     const items = await fetchStacItems(selectedBounds);
     debug(`${items.length} STAC-Items gefunden.`);
-    const tiles = chooseLatestTiles(items, sourceRes);
-    debug(`${tiles.length} aktuelle GeoTIFF-Kacheln (${sourceRes} m) gewählt.`);
-    if (!tiles.length) throw new Error(`Keine swissALTI³D-${sourceRes}-m-GeoTIFFs für diesen Ausschnitt gefunden.`);
-    if (tiles.length > MAX_TILES) throw new Error(`${tiles.length} Kacheln wären nötig. Bitte einen kleineren Ausschnitt wählen.`);
+    const plans = makeTilePlans(items, sourceRes);
+    debug(`${plans.length} räumliche 1-km-Kacheln geplant; Fallback-Jahrgänge und Alternativauflösung verfügbar.`);
+    if (!plans.length) throw new Error(`Keine swissALTI³D-GeoTIFFs für diesen Ausschnitt gefunden.`);
+    if (plans.length > MAX_TILES) throw new Error(`${plans.length} Kacheln wären nötig. Bitte einen kleineren Ausschnitt wählen.`);
 
-    const grid = outputGrid(d);
-    let totalWritten = 0;
-    for (let i = 0; i < tiles.length; i++) {
-      const { asset, item } = tiles[i];
-      const pct = 12 + 68 * (i / tiles.length);
-      setStatus(`Höhendaten ${i+1}/${tiles.length}`, pct);
-      try {
-        totalWritten += await sampleTile(asset.href, d, grid);
-      } catch (err) {
-        debug(`Kachel übersprungen ${item.id}: ${err.message}`);
-      }
-      if (i % 8 === 0) await new Promise(r => setTimeout(r, 0));
+    const loadResult = await loadPlansConcurrent(plans, d, grid, (done, total) => {
+      const pct = 12 + 68 * (done / total);
+      setStatus(`Höhendaten ${done}/${total} · ${TILE_CONCURRENCY} parallele Downloads`, pct);
+    });
+    if (loadResult.fallbackUsed.length) debug(`${loadResult.fallbackUsed.length} Kacheln erfolgreich über Fallback geladen.`);
+    if (loadResult.failed.length) {
+      debug(`${loadResult.failed.length} Kacheln nach allen Versuchen nicht geladen:`);
+      for (const f of loadResult.failed.slice(0, 30)) debug(`  ${f.plan.key}: ${f.errors.slice(-2).join(' | ')}`);
+      if (loadResult.failed.length > 30) debug(`  … ${loadResult.failed.length - 30} weitere`);
     }
 
-    setStatus('Raster prüfen und aufbereiten', 82);
-    if (els.smoothMissing.checked) fillSmallGaps(grid);
+    setStatus('Raster prüfen und Restlücken interpolieren', 82);
+    let filled = 0;
+    if (els.smoothMissing.checked) filled = fillSmallGaps(grid);
     const stats = terrainStats(grid);
     const missingPct = stats.missing / stats.total * 100;
-    debug(`Raster: ${grid.cols} × ${grid.rows}; geschrieben: ${totalWritten}; Lücken: ${missingPct.toFixed(2)} %`);
-    if (!Number.isFinite(stats.min) || missingPct > 8) {
-      throw new Error(`Zu viele fehlende Höhenwerte (${missingPct.toFixed(1)} %). Prüfe Ausschnitt oder versuche die 2-m-Quelle.`);
-    }
-    // Remaining isolated holes: nearest simple fallback to minimum, avoiding invalid STL.
-    if (stats.missing) {
-      for (let i = 0; i < grid.values.length; i++) if (!Number.isFinite(grid.values[i])) grid.values[i] = stats.min;
+    debug(`Raster: ${grid.cols} × ${grid.rows}; geschrieben: ${loadResult.totalWritten}; interpoliert: ${filled}; Restlücken: ${missingPct.toFixed(4)} %`);
+    if (!Number.isFinite(stats.min)) throw new Error('Keine gültigen Höhenwerte geladen.');
+    // Critical invariant: never export a terrain with NaN / missing elevations.
+    // A failed generation is preferable to a rectangular crater in the print.
+    if (stats.missing > 0) {
+      throw new Error(`Relief nicht erzeugt: ${stats.missing.toLocaleString('de-CH')} Höhenpunkte (${missingPct.toFixed(3)} %) fehlen noch. Es wird bewusst KEINE fehlerhafte STL mit Löchern erzeugt. Bitte erneut versuchen; die App nutzt automatisch Fallback-Kacheln.`);
     }
 
     terrain = { grid, dims: d, stats };
@@ -390,7 +510,8 @@ function buildBinaryStl(t) {
   const { cols, rows, values } = t.grid;
   const w = t.dims.widthMm, h = t.dims.depthMm;
   const topTriangles = 2 * (cols - 1) * (rows - 1);
-  const sideTriangles = 2 * ((cols - 1) + (rows - 1));
+  // Two walls per axis side, two triangles per wall segment = 4× perimeter segments.
+  const sideTriangles = 4 * ((cols - 1) + (rows - 1));
   const triCount = topTriangles + sideTriangles + 2;
   const buffer = new ArrayBuffer(84 + triCount * 50);
   const view = new DataView(buffer);
